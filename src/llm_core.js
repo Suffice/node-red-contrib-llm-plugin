@@ -525,30 +525,54 @@ function createLLMCore(RED) {
 
     // `options.timeoutMs` (0 = none) bounds the wait; `options.signal` lets
     // the caller give up earlier, e.g. when the requester went away.
-    function generateWithProvider(provider, settings, model, messages, options) {
+    //
+    // `onEvent` (optional) is called, in order, as the model's output
+    // arrives: `{ type: 'thought', content }` for a piece of the model's
+    // reasoning, `{ type: 'chunk', content }` for a piece of the reply
+    // text. The promise resolves with the joined reply text once the
+    // stream's end marker has been seen; a timeout or a stream cut
+    // mid-reply rejects it.
+    async function streamGenerateWithProvider(provider, settings, model, messages, onEvent, options) {
         const timeoutMs = (options && typeof options.timeoutMs === 'number' && options.timeoutMs > 0)
             ? Math.floor(options.timeoutMs)
             : 0;
         const signal = (options && options.signal) || undefined;
         if (provider === 'openai') {
             if (!settings.openaiApiKey) {
-                return Promise.reject(new Error('OpenAI API key is not configured. Please set it in LLM Plugin settings.'));
+                throw new Error('OpenAI API key is not configured. Please set it in LLM Plugin settings.');
             }
-            return generateWithOpenAIResponses(settings.openaiApiKey, model, messages, timeoutMs, signal);
+            return generateWithOpenAIResponses(settings.openaiApiKey, model, messages, timeoutMs, signal, onEvent);
         }
         if (provider === 'custom') {
             let baseUrl = (settings.customBaseUrl && String(settings.customBaseUrl).trim()) || '';
             if (!baseUrl) {
-                return Promise.reject(new Error('Custom endpoint Base URL is not configured. Please set it in LLM Plugin settings.'));
+                throw new Error('Custom endpoint Base URL is not configured. Please set it in LLM Plugin settings.');
             }
-            return generateWithOpenAICompatible(settings.customApiKey, baseUrl, model, messages, timeoutMs, signal);
+            return generateWithOpenAICompatible(settings.customApiKey, baseUrl, model, messages, timeoutMs, signal, onEvent);
         }
-        return generateWithOllamaChat(settings, model, messages, timeoutMs, signal);
+        return generateWithOllamaChat(settings, model, messages, timeoutMs, signal, onEvent);
+    }
+
+    // The one-shot form callers have always had: the reply text, alone.
+    function generateWithProvider(provider, settings, model, messages, options) {
+        return streamGenerateWithProvider(provider, settings, model, messages, null, options);
+    }
+
+    // The same generation with the thought collected alongside: resolves
+    // `{ content, thought }`, `thought` null when the model reasoned
+    // nothing.
+    function generateWithThought(provider, settings, model, messages, options) {
+        let thought = '';
+        return streamGenerateWithProvider(provider, settings, model, messages, function(evt) {
+            if (evt && evt.type === 'thought') thought += evt.content || '';
+        }, options).then(function(content) {
+            return { content: content, thought: thought || null };
+        });
     }
 
     // Ollama chat generation (timeout 0 = wait indefinitely). `fetch` rather
     // than http/https: one code path for both schemes.
-    async function generateWithOllamaChat(settings, model, messages, timeout = 0, callerSignal) {
+    async function generateWithOllamaChat(settings, model, messages, timeout = 0, callerSignal, onEvent) {
         const ollamaUrlStr = (settings && settings.ollamaUrl) || 'http://localhost:11434';
         // No fallback to localhost: the settings endpoint already rejects
         // unparseable URLs, and a silent redirect would be unexplainable.
@@ -580,7 +604,7 @@ function createLLMCore(RED) {
                 const responseData = await res.text();
                 throw new Error(`Ollama API error (${res.status}): ${responseData.substring(0, 200)}`);
             }
-            return await readOllamaStream(res.body);
+            return await readOllamaStream(res.body, onEvent);
         } catch (e) {
             if (callerSignal && callerSignal.aborted) throw e;
             // Callers detect a timeout by `err.code === 'ETIMEDOUT'` rather
@@ -597,7 +621,7 @@ function createLLMCore(RED) {
 
     // One JSON object per line; the reply is the `message.content` pieces
     // joined. An `error` line is Ollama failing mid-generation.
-    async function readOllamaStream(stream) {
+    async function readOllamaStream(stream, onEvent) {
         const decoder = new TextDecoder();
         let buffer = '';
         let content = '';
@@ -609,9 +633,20 @@ function createLLMCore(RED) {
             let obj;
             try { obj = JSON.parse(line); } catch (e) { throw new Error('Invalid response format'); }
             if (obj && obj.error) throw new Error('Ollama API error: ' + String(obj.error).substring(0, 200));
-            if (obj && obj.message && typeof obj.message.content === 'string') {
-                content += obj.message.content;
-                sawMessage = true;
+            if (obj && obj.message) {
+                const m = obj.message;
+                // Reasoning models (qwen3, deepseek-r1, …) stream their
+                // thinking in the same lines, in `message.thinking`.
+                if (typeof m.thinking === 'string' && m.thinking && onEvent) {
+                    onEvent({ type: 'thought', content: m.thinking });
+                }
+                if (typeof m.content === 'string') {
+                    if (m.content) {
+                        content += m.content;
+                        if (onEvent) onEvent({ type: 'chunk', content: m.content });
+                    }
+                    sawMessage = true;
+                }
             }
             if (obj && obj.done === true) done = true;
         }
@@ -704,30 +739,119 @@ function createLLMCore(RED) {
         if (!finished) throw connectionClosed();
     }
 
-    async function generateWithOpenAICompatible(apiKey, baseURL, model, messages, timeoutMs, signal) {
-        const openai = openAIClient(apiKey, baseURL);
+    // A chat-completions stream is server-sent events: one `data:` line per
+    // event, terminated by `data: [DONE]`. Read raw rather than through the
+    // SDK, which swallows the terminator: a server that ends on `[DONE]`
+    // without a final `finish_reason` must count as a complete reply, not a
+    // cut connection.
+    async function readSseStream(stream, onEvent, blankMessage) {
+        const decoder = new TextDecoder();
+        let buffer = '';
         let content = '';
-        await readSdkStream(function(opts) {
-            return openai.chat.completions.create({
-                messages: Array.isArray(messages) ? messages : [],
-                model: model,
-                stream: true,
-            }, opts);
-        }, function(part) {
-            const choice = part && part.choices && part.choices[0];
-            if (!choice) return undefined;
-            if (choice.delta && typeof choice.delta.content === 'string') content += choice.delta.content;
-            // The last chunk carries `finish_reason`; without it the stream was cut.
-            return !!choice.finish_reason;
-        }, timeoutMs, signal,
-        'The LLM endpoint returned no message content. Verify the Base URL points to an ' +
-            'OpenAI-compatible chat-completions API (e.g. ends in /v1) and that the model name is valid.');
+        let sawContent = false;
+        let sawData = false;
+        let firstLine = '';
+        let finished = false;
+        function takeLine(line) {
+            line = line.trim();
+            if (!line) return;                       // event separator
+            if (line.charAt(0) === ':') return;      // comment / keep-alive
+            if (!line.startsWith('data:')) {
+                if (!firstLine) firstLine = line;
+                return;
+            }
+            const data = line.slice(5).trim();
+            if (data === '[DONE]') { finished = true; return; }
+            sawData = true;
+            let obj;
+            try { obj = JSON.parse(data); } catch (e) { throw new Error('Invalid response format'); }
+            const choice = (obj && Array.isArray(obj.choices) && obj.choices[0]) || null;
+            if (!choice) return;
+            const delta = choice.delta;
+            if (delta) {
+                // Reasoning rides different fields on different compatible
+                // servers: vLLM / LM Studio / LocalAI follow DeepSeek's
+                // `reasoning_content`, llama.cpp its `reasoning`.
+                const reasoning = (typeof delta.reasoning_content === 'string' && delta.reasoning_content)
+                    ? delta.reasoning_content
+                    : ((typeof delta.reasoning === 'string' && delta.reasoning) ? delta.reasoning : '');
+                if (reasoning && onEvent) onEvent({ type: 'thought', content: reasoning });
+                if (typeof delta.content === 'string' && delta.content) {
+                    content += delta.content;
+                    sawContent = true;
+                    if (onEvent) onEvent({ type: 'chunk', content: delta.content });
+                }
+            }
+            // The last chunk carries `finish_reason`; some servers end with
+            // a bare `[DONE]` instead — either counts as a whole reply.
+            if (choice.finish_reason) finished = true;
+        }
+        for await (const chunk of stream) {
+            buffer += decoder.decode(chunk, { stream: true });
+            let nl;
+            while ((nl = buffer.indexOf('\n')) !== -1) {
+                takeLine(buffer.slice(0, nl));
+                buffer = buffer.slice(nl + 1);
+            }
+        }
+        takeLine(buffer + decoder.decode());
+        if (!finished) {
+            // A clean end without a terminator is a dropped connection —
+            // unless the body was not a chat-completions stream at all.
+            if (!sawData) {
+                throw new Error('The LLM endpoint answered, but not with a chat-completions stream. ' +
+                    'Verify the Base URL points to an OpenAI-compatible chat-completions API ' +
+                    '(e.g. ends in /v1). It said: ' + (firstLine || '<empty body>').substring(0, 200));
+            }
+            throw connectionClosed();
+        }
+        if (!sawContent) throw new Error(blankMessage);
         return content;
+    }
+
+    async function generateWithOpenAICompatible(apiKey, baseURL, model, messages, timeoutMs, signal, onEvent) {
+        const headers = { 'Content-Type': 'application/json; charset=utf-8' };
+        const key = (apiKey && String(apiKey).trim());
+        if (key) headers.Authorization = 'Bearer ' + key;
+        const base = String(baseURL).trim();
+        const endpoint = /\/v1$/.test(base) ? base + '/chat/completions' : base + '/v1/chat/completions';
+        try {
+            const res = await fetch(endpoint, {
+                method: 'POST',
+                headers: headers,
+                body: JSON.stringify({
+                    model: model,
+                    messages: Array.isArray(messages) ? messages : [],
+                    stream: true
+                }),
+                // Bounds the total wait, which is what the setting means.
+                signal: combineSignals(
+                    (timeoutMs && timeoutMs > 0) ? AbortSignal.timeout(timeoutMs) : null, signal)
+            });
+            if (res.status >= 400) {
+                const responseData = await res.text();
+                throw new Error(`The LLM endpoint returned HTTP ${res.status}: ${responseData.substring(0, 200)}`);
+            }
+            return await readSseStream(res.body, onEvent,
+                'The LLM endpoint returned no message content. Verify the Base URL points to an ' +
+                    'OpenAI-compatible chat-completions API (e.g. ends in /v1) and that the model name is valid.');
+        } catch (e) {
+            if (signal && signal.aborted) throw e;
+            // Callers detect a timeout by `err.code === 'ETIMEDOUT'` rather
+            // than by parsing the message, and an aborted fetch carries no
+            // such code. Put it back.
+            if (e && (e.name === 'TimeoutError' || e.name === 'AbortError')) {
+                const timedOut = new Error('Request timed out');
+                timedOut.code = 'ETIMEDOUT';
+                throw timedOut;
+            }
+            throw e;
+        }
     }
 
     // System messages become `instructions`; the rest is the input. `store:
     // false`: OpenAI keeps a response for 30 days unless told not to.
-    async function generateWithOpenAIResponses(apiKey, model, messages, timeoutMs, signal) {
+    async function generateWithOpenAIResponses(apiKey, model, messages, timeoutMs, signal, onEvent) {
         const openai = openAIClient(apiKey, null);
         const list = Array.isArray(messages) ? messages : [];
         const instructions = list.filter(function(m) { return m && m.role === 'system'; })
@@ -741,10 +865,17 @@ function createLLMCore(RED) {
             return openai.responses.create(body, opts);
         }, function(ev) {
             if (!ev || !ev.type) return undefined;
+            // The Responses API streams a summary of the reasoning, not
+            // the full thought — that one stays on OpenAI's side.
+            if (ev.type === 'response.reasoning_summary_text.delta') {
+                if (ev.delta && onEvent) onEvent({ type: 'thought', content: ev.delta });
+                return false;
+            }
             // A refusal is the model's answer too; dropping it would leave
             // an empty reply with no reason.
             if (ev.type === 'response.output_text.delta' || ev.type === 'response.refusal.delta') {
                 content += ev.delta || '';
+                if (ev.delta && onEvent) onEvent({ type: 'chunk', content: ev.delta });
                 return false;
             }
             if (ev.type === 'response.completed') return true;
@@ -777,7 +908,9 @@ function createLLMCore(RED) {
         buildMessages: buildMessages,
         // generation
         DEFAULT_TIMEOUT_MS: DEFAULT_TIMEOUT_MS,
-        generateWithProvider: generateWithProvider
+        generateWithProvider: generateWithProvider,
+        streamGenerateWithProvider: streamGenerateWithProvider,
+        generateWithThought: generateWithThought
     };
     return sharedInstance;
 }

@@ -1,6 +1,7 @@
 // The admin routes' own guarantees, driven through the real handlers: what the
 // unauthenticated routes hand out and what a write is refused for.
 const fs = require('fs');
+const http = require('http');
 const path = require('path');
 const { ok, summary, ROOT } = require('../helpers.js');
 
@@ -43,6 +44,124 @@ function call(handler, req) {
     Promise.resolve(handler(Object.assign({ query: {}, params: {}, body: {} }, req || {}), res))
       .catch((e) => resolve({ status: 500, body: { error: String(e && e.message) } }));
   });
+}
+// A streamed answer writes `data:` lines and ends: this captures both, the way
+// the one-shot `call` above captures the single JSON body.
+function callStream(handler, req) {
+  return new Promise((resolve) => {
+    const res = {
+      statusCode: 200,
+      headers: {},
+      writableEnded: false,
+      writableFinished: false,
+      on() {},
+      setHeader(k, v) { this.headers[String(k).toLowerCase()] = v; },
+      status(code) { this.statusCode = code; return this; },
+      json(body) { this.writableEnded = true; this.writableFinished = true; resolve({ status: this.statusCode, headers: this.headers, body: body }); return this; },
+      send(body) { this.writableEnded = true; this.writableFinished = true; resolve({ status: this.statusCode, headers: this.headers, body: String(body) }); return this; },
+      write(s) { (this.chunks = this.chunks || []).push(String(s)); return true; },
+      end() { this.writableEnded = true; this.writableFinished = true; resolve({ status: this.statusCode, headers: this.headers, chunks: (this.chunks || []).join('') }); return this; },
+    };
+    Promise.resolve(handler(Object.assign({ query: {}, params: {}, body: {} }, req || {}), res))
+      .catch((e) => resolve({ status: 500, body: { error: String(e && e.message) } }));
+  });
+}
+
+function sseEvents(text) {
+  const out = [];
+  for (const line of String(text).split('\n')) {
+    const t = line.trim();
+    if (t.indexOf('data:') !== 0) continue; // a keep-alive tick carries no data
+    try { out.push(JSON.parse(t.slice(5).trim())); } catch (e) { /* not a line of ours */ }
+  }
+  return out;
+}
+
+function serve(handler) {
+  return new Promise((resolve) => {
+    const server = http.createServer(handler);
+    server.listen(0, '127.0.0.1', () => {
+      resolve({ server, port: server.address().port,
+                close: () => new Promise((r) => server.close(r)) });
+    });
+  });
+}
+
+// A reasoning model writes its thought ahead of the answer, and the route must
+// relay each piece as it arrives — that is the point of streaming, not a
+// faster one-shot answer.
+async function scenarioGenerateStreamsThoughtThenAnswer() {
+  console.log('\n/generate with stream:true relays the thought and the answer piece by piece');
+  const s = await serve((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    const d = (o) => 'data: ' + JSON.stringify(o) + '\n\n';
+    res.write(d({ choices: [{ index: 0, delta: { reasoning_content: 'step one' } }] }));
+    res.write(d({ choices: [{ index: 0, delta: { reasoning_content: ' step two' } }] }));
+    res.write(d({ choices: [{ index: 0, delta: { content: 'hello' } }] }));
+    res.write(d({ choices: [{ index: 0, delta: { content: ' world' } }] }));
+    res.end('data: [DONE]\n\n');
+  });
+  try {
+    await call(RED.routes.post['/llm-plugin/settings'],
+      { body: { provider: 'custom', customBaseUrl: 'http://127.0.0.1:' + s.port + '/v1' } });
+    const r = await callStream(RED.routes.post['/llm-plugin/generate'],
+      { body: { model: 'm', prompt: 'hi', stream: true } });
+    ok(r.status === 200, 'the stream is a 200 (' + r.status + ')');
+    ok(/text\/event-stream/.test(r.headers['content-type'] || ''), 'answered as SSE');
+    const events = sseEvents(r.chunks);
+    ok(events.length === 5, 'five events: two thought, two chunk, one done (' + events.length + ')');
+    ok(events[0].type === 'thought' && events[1].type === 'thought', 'the thought is relayed first');
+    ok(events[0].content === 'step one' && events[1].content === ' step two', '…as written, unjoined');
+    ok(events[2].type === 'chunk' && events[2].content === 'hello', 'then the answer, piece by piece');
+    ok(events[3].type === 'chunk' && events[3].content === ' world', '…and the rest');
+    ok(events[4].type === 'done' && events[4].model === 'm' && typeof events[4].elapsed === 'number',
+      'the done line carries the model and the elapsed time');
+  } finally { await s.close(); }
+}
+
+// The same question asked without streaming gets one JSON answer — with the
+// thought still attached, so a client that cannot stream loses nothing.
+async function scenarioOneShotStillCarriesTheThought() {
+  console.log('\n/generate without stream:true answers one JSON object, thought included');
+  const s = await serve((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    const d = (o) => 'data: ' + JSON.stringify(o) + '\n\n';
+    res.write(d({ choices: [{ index: 0, delta: { reasoning_content: 'step one' } }] }));
+    res.write(d({ choices: [{ index: 0, delta: { reasoning_content: ' step two' } }] }));
+    res.write(d({ choices: [{ index: 0, delta: { content: 'hello' } }] }));
+    res.write(d({ choices: [{ index: 0, delta: { content: ' world' } }] }));
+    res.end('data: [DONE]\n\n');
+  });
+  try {
+    await call(RED.routes.post['/llm-plugin/settings'],
+      { body: { provider: 'custom', customBaseUrl: 'http://127.0.0.1:' + s.port + '/v1' } });
+    const r = await call(RED.routes.post['/llm-plugin/generate'], { body: { model: 'm', prompt: 'hi' } });
+    ok(r.status === 200, 'the one-shot answer is a 200 (' + r.status + ')');
+    ok(r.body && r.body.response === 'hello world', 'the answer is the joined content (' + (r.body && r.body.response) + ')');
+    ok(r.body && r.body.thought === 'step one step two', 'the thought is kept beside it (' + (r.body && r.body.thought) + ')');
+  } finally { await s.close(); }
+}
+
+// A proxy that drops the connection mid-reply must end the stream as an error
+// event, not as a `done` that would look like a finished answer.
+async function scenarioCutStreamEndsAsAnError() {
+  console.log('\na reply cut off mid-stream ends the answer as an error');
+  const s = await serve((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    res.end('data: ' + JSON.stringify({ choices: [{ index: 0, delta: { content: 'half' } }] }) + '\n\n');
+  });
+  try {
+    await call(RED.routes.post['/llm-plugin/settings'],
+      { body: { provider: 'custom', customBaseUrl: 'http://127.0.0.1:' + s.port + '/v1' } });
+    const r = await callStream(RED.routes.post['/llm-plugin/generate'],
+      { body: { model: 'm', prompt: 'hi', stream: true } });
+    const events = sseEvents(r.chunks);
+    ok(events.some((e) => e.type === 'chunk'), 'the piece that arrived is still relayed');
+    ok(!events.some((e) => e.type === 'done'), 'no done line for an unfinished reply');
+    const err = events.find((e) => e.type === 'error');
+    ok(!!err, 'the cut stream ends as an error event');
+    ok(err && /closed/.test(err.message || ''), '…and it says the connection closed (' + (err && err.message) + ')');
+  } finally { await s.close(); }
 }
 
 fs.rmSync(WORK, { recursive: true, force: true });
@@ -119,6 +238,9 @@ async function scenarioRefusedConnectionIsNamed() {
   await scenarioCheckpointMetaCounts();
   await scenarioChatDeletedById();
   await scenarioRefusedConnectionIsNamed();
+  await scenarioGenerateStreamsThoughtThenAnswer();
+  await scenarioOneShotStillCarriesTheThought();
+  await scenarioCutStreamEndsAsAnError();
   fs.rmSync(WORK, { recursive: true, force: true });
   summary();
 })();

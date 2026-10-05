@@ -575,6 +575,24 @@
         messageContent.className = 'message-content';
         messageContent.innerHTML = formatMessage(content);
         collapseJsonBlocks(messageContent);
+
+        // A reasoning model's thought, streamed ahead of the answer and kept
+        // on the reply's meta: shown above it, collapsed by default so the
+        // answer leads.
+        let thought = metaOf(messageMeta).thought;
+        if (!isUser && typeof thought === 'string' && thought) {
+            let thoughtBlock = document.createElement('details');
+            thoughtBlock.className = 'llm-message-thought';
+            let summary = document.createElement('summary');
+            summary.textContent = 'Thinking';
+            let thoughtText = document.createElement('div');
+            thoughtText.className = 'llm-message-thought-text';
+            thoughtText.textContent = thought;
+            thoughtBlock.appendChild(summary);
+            thoughtBlock.appendChild(thoughtText);
+            message.insertBefore(thoughtBlock, messageContent);
+        }
+
         message.appendChild(messageContent);
 
         if (!isUser) {

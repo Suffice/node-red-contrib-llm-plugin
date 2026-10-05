@@ -1,11 +1,44 @@
 <meta charset="utf-8">
 <link rel="stylesheet" type="text/css" href="llm-plugin/styles.css">
 <!-- marked.js and DOMPurify come from the plugin's own dependencies, not a
-     CDN, so replies render offline. -->
-<script src="llm-plugin/vendor/marked.js" charset="utf-8"></script>
-<script src="llm-plugin/vendor/purify.js" charset="utf-8"></script>
-
-<script src="llm-plugin/src/client.js" charset="utf-8"></script>
+     CDN, so replies render offline.
+     They are loaded by the inline bootstrap below instead of <script src>
+     tags: the editor's plugin loader waits for every template script to
+     fire onload - and never for onerror. After a palette install without a
+     Node-RED restart the editor serves this (new) template while the
+     runtime still runs the previous plugin code, a vendor script can 404,
+     and a plain <script src> would wedge the editor at "Loading Plugins"
+     forever. Loading the assets here keeps a missing asset from ever
+     blocking the editor: the sidebar degrades, the console says why. -->
+<script>
+(function () {
+    window.LLMPlugin = window.LLMPlugin || {};
+    LLMPlugin.loadError = function (src, err) {
+        console.error('[LLM Plugin] could not load ' + src +
+            (err && err.message ? ': ' + err.message : '') +
+            ' - if this appears right after a palette install, restart ' +
+            'Node-RED so the runtime picks up the new plugin code.');
+    };
+    function load(src) {
+        return new Promise(function (resolve, reject) {
+            var s = document.createElement('script');
+            s.src = src;
+            s.charset = 'utf-8';
+            s.onload = resolve;
+            s.onerror = reject;
+            document.head.appendChild(s);
+        });
+    }
+    // Vendor libs first (chat rendering needs both), then the client
+    // bootstrap, which fetches and executes the remaining modules itself.
+    Promise.all([
+        load('llm-plugin/vendor/marked.js').catch(function (e) { LLMPlugin.loadError('llm-plugin/vendor/marked.js', e); return null; }),
+        load('llm-plugin/vendor/purify.js').catch(function (e) { LLMPlugin.loadError('llm-plugin/vendor/purify.js', e); return null; })
+    ]).then(function () {
+        return load('llm-plugin/src/client.js').catch(function (e) { LLMPlugin.loadError('llm-plugin/src/client.js', e); });
+    });
+})();
+</script>
 
 <!-- Sidebar DOM. Injected by vibe_ui.js (createLLMPluginUI); kept here so
      markup lives in HTML, not JS strings. -->

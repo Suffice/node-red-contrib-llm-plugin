@@ -13,7 +13,7 @@ Plugin sidebar.
 Editor sidebar (vibe_ui)  ──Send──►  /llm-plugin/generate  ──►  Ollama / OpenAI / Custom
         ▲                                              │
         │                                              ▼
-   addMessageToUI                          response { response, model, elapsed }
+   addMessageToUI                          response { response, thought, model, elapsed }
    importFlowFromMessage  ◄──────────────────────────────┘
         │
         ├── extractFlowNodes  (LLMJsonParser → Vibe Schema → FlowConverterCore.toNodeRed)
@@ -24,6 +24,13 @@ Editor sidebar (vibe_ui)  ──Send──►  /llm-plugin/generate  ──►  
                                (falls back to replaceWorkspaceFlow = clear +
                                 re-import, when the diff cannot express it)
 ```
+
+When the request sets `stream: true`, `/generate` answers with a Server-Sent
+Events stream — one `data:` line per thought piece or text chunk the model
+produces, ending in a `done` event (or `error`) — instead of one JSON object.
+The sidebar always streams: the reply, including a reasoning model's chain of
+thought, is painted in as it arrives; the flow is applied only once the reply
+is complete.
 
 Three independent core modules under `src/core/` form the conversion +
 layout backbone:
@@ -81,7 +88,7 @@ converter's `toNodeRed` delegates layout to it. All modules use the IIFE pattern
 
 | Method | Path | Permission | Purpose |
 |--------|------|------------|---------|
-| POST | `/llm-plugin/generate` | write | Send prompt + flow context to the LLM. `mode: "ask"` asks for an explanation of the flow, anything else asks for a schema — the mode picks the system prompt, so it is decided here, not in the browser. Times out after an hour, and is abandoned when the sidebar closes the connection (Stop) |
+| POST | `/llm-plugin/generate` | write | Send prompt + flow context to the LLM. `mode: "ask"` asks for an explanation of the flow, anything else asks for a schema — the mode picks the system prompt, so it is decided here, not in the browser. Times out after an hour, and is abandoned when the sidebar closes the connection (Stop). With `stream: true` in the body the answer is an SSE stream — one `data:` line per thought piece or text chunk, then a `done` event (or `error`) — which is what the sidebar uses, so the reply is painted in as it arrives |
 | GET | `/llm-plugin/settings` | read | Read settings (API key masked) |
 | POST | `/llm-plugin/settings` | write | Write settings (whitelisted fields) |
 | GET | `/llm-plugin/chats` | read | List persisted chats |
@@ -408,7 +415,8 @@ sidebar — there is only one settings + credentials store.
 | Storage resolution | `chatsDir` / `checkpointsDir` / `persistenceEnabled` (`<userDir>/llm-plugin`, else memory only), `writeFileAtomic` |
 | Settings + credentials | `getPluginSettings`, `savePluginSettings`, encrypted `credentials.json` (AES-256-GCM), legacy-key migration, `maskApiKey`, `redactSecrets` |
 | Prompt construction | `buildMessages(prompt, flowContext, activeWorkspaceId, settings, options?)` — `options.mode === 'ask'` uses `prompt_ask.txt` (explain the flow, propose nothing), anything else `prompt_system.txt` (the Vibe Schema rules); the flow context is built the same way for both. The `llm-request` node builds its own messages (its system prompt and the prompt) and uses none of this |
-| LLM adapters | `generateWithProvider(provider, settings, model, messages, {timeoutMs})` → `generateWithOllamaChat` (`/api/chat`), `generateWithOpenAIResponses` (OpenAI: the SDK's Responses API, `/v1/responses`, system messages as `instructions`, `store: false` — newer models are served there, some only there) or `generateWithOpenAICompatible` (Custom: chat completions, which llama.cpp / LM Studio / vLLM / LocalAI speak). All **stream** the reply: unstreamed, the endpoint sends no headers until it is done, and Node's `fetch` gives up waiting for headers after 300 s whatever the timeout says (the SDK then re-sent the whole generation twice). A stream is whole only once its end marker arrives (Ollama `done`, chat completions `finish_reason`, Responses `response.completed`; a Responses stream that ends `incomplete` is an error naming the reason): a proxy that drops the connection ends it just as cleanly, so without the marker it is an `ECONNRESET`, not a short reply. The timeout bounds the whole reply; network errors keep their code on `cause`, which the generate route reads to say "Could not connect". |
+| LLM adapters | `generateWithProvider(provider, settings, model, messages, {timeoutMs})` → `generateWithOllamaChat` (`/api/chat`), `generateWithOpenAIResponses` (OpenAI: the SDK's Responses API, `/v1/responses`, system messages as `instructions`, `store: false` — newer models are served there, some only there) or `generateWithOpenAICompatible` (Custom: chat completions, which llama.cpp / LM Studio / vLLM / LocalAI speak). All **stream** the reply: unstreamed, the endpoint sends no headers until it is done, and Node's `fetch` gives up waiting for headers after 300 s whatever the timeout says (the SDK then re-sent the whole generation twice). A stream is whole only once its end marker arrives (Ollama `done`, chat completions `finish_reason`, Responses `response.completed`; a Responses stream that ends `incomplete` is an error naming the reason): a proxy that drops the connection ends it just as cleanly, so without the marker it is an `ECONNRESET`, not a short reply. The timeout bounds the whole reply; network errors keep their code on `cause`, which the generate route reads to say "Could not connect". Each adapter also carries a reasoning model's chain of thought in whatever shape the provider streams it — chat completions' `reasoning_content` (vLLM / LM Studio) or `reasoning` (llama.cpp), the Responses API's reasoning `summary`, Ollama's `thinking` deltas — so the thought arrives as its own piece, usually before the reply text |
+| Streaming to the client | `streamGenerateWithProvider(provider, settings, model, messages, onEvent, {timeoutMs, signal})` — the same three adapters, only the reply is not joined: each thought piece and text chunk is handed to `onEvent` the moment it arrives, and a stream cut before its end marker is still an error. The `/generate` route's SSE branch is this function with one `data:` line written per event. `generateWithThought` is `generateWithProvider` plus the collected `thought` (absent when the model did not think) — what the one-shot route and the `llm-request` node (which passes it out on `msg.thought`) use |
 
 ### `server.js`
 
@@ -419,7 +427,7 @@ Thin HTTP layer over `llm_core.js`, plus the sidebar-only persistence.
 | Chat history | `saveChatHistory`, `loadAllChatHistories` (per-chat JSON files) |
 | Checkpoints | `saveCheckpoint` (per-import flow snapshots) |
 | Client logging | `writeClientEvent` (secret-redacted, into `RED.log`) |
-| HTTP admin endpoints | All `RED.httpAdmin.*` routes (delegating generation to the engine) |
+| HTTP admin endpoints | All `RED.httpAdmin.*` routes (delegating generation to the engine; `/generate` answers one JSON object, or the SSE stream above when the body sets `stream: true`) |
 
 ### `node/` — the `llm-request` node
 

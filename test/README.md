@@ -56,6 +56,7 @@ ones that did.
 | `ui_templates` | The seam between `llm_plugin.html` and `ui_core.js`: every id the JS clones exists, every template has a single well-formed root, and the classes reached for after cloning are in the markup. Also the two static seams that rot silently — the docs link in the header, and the `llm-request` node, which must stay a thin caller of the shared core (no editor path, no plugin logic in its html), be registered and published by `package.json`, and keep a help panel short enough to read. And the plugin raises no editor notification of its own: nothing calls `RED.notify`, and a warning is a line in the chat. |
 | `server_api` | The admin routes' guarantees: the unauthenticated `src/` routes serve exactly what `client.js` loads, checkpoint `meta` is bounded, an unknown provider is refused, a chat is deleted by id. |
 | `group_schema` | Group boxes are the user's: a reply cannot create, edit or delete one, and the context shows none without moving any node alias. An edit keeps a box around its one sequence: a new node wired into it joins the box, a comment follows the node its `above` names into (or out of) a box, a box stays when emptied, and every box is refitted around where its members end up, clear of the next sequence. A branch added inside a box lands clear of the others in port order. |
+| `stream_generation` | What the client sees when the model thinks: the streaming request is a stream on the wire (`stream: true` goes out to the provider), the chain of thought is relayed as its own events — chat completions' `reasoning_content` / `reasoning`, the Responses API's `summary`, Ollama's `thinking` — and a non-streamed reply still arrives whole, content and thought together. |
 
 `helpers.js` holds the assertion counter and `loadPluginSandbox(RED, opts)`, which
 runs the real client modules in a vm context in the same order `client.js` uses —
@@ -224,6 +225,7 @@ test/
 | `ui_templates` | `llm_plugin.html` と `ui_core.js` の継ぎ目。JS が複製する id がすべて存在し、各テンプレートのルートが単一かつ整形式で、複製後に参照するクラスがマークアップ側にあること。無言で腐る 2 つの継ぎ目 — ヘッダのドキュメントリンクと、`llm-request` ノード(共有コアを呼ぶだけでエディタ側の経路を持たず、html にプラグインのロジックがないこと、`package.json` で登録・公開されること、ヘルプが読める長さに収まっていること)も見る。プラグインが独自の通知を出さないこと(`RED.notify` を呼ぶ箇所がなく、警告はチャット欄の1行になること)も確かめる。 |
 | `server_api` | 管理ルートの保証を検証。未認証の `src/` ルートが `client.js` の読み込むものだけを配ること、チェックポイントの `meta` に上限があること、未知のプロバイダを拒むこと、チャットを ID で削除できること。 |
 | `group_schema` | グループの枠はユーザーのもの。応答は枠を作れず、編集も削除もできず、コンテキストは枠を見せずにノードのエイリアスも動かさないこと。編集は枠を1本のシーケンスに沿わせたまま保つこと。つながれた新しいノードは枠に入り、コメントは `above` で指定したノードに従って枠に出入りし、空になった枠も残り、すべての枠はメンバーの最終位置に合わせ直されて次の並びと重ならないこと。枠内に追加した分岐が他と重ならずポート順に並ぶこと。 |
+| `stream_generation` | 考えながら答えるモデルの応答をクライアントがどう見るか。ストリーミングのリクエストはプロバイダへも本当にストリーミングで送られること(`stream: true` がそのまま出ていくこと)、思考が独立したイベントとして中継されること(chat completions の `reasoning_content` / `reasoning`、Responses API の `summary`、Ollama の `thinking`)、ストリーミングしない応答も本文と思考が丸ごと届くこと。 |
 
 `helpers.js` には、アサーションの集計と `loadPluginSandbox(RED, opts)` を置いている。
 後者はクライアントの各モジュールを実際に vm 上で読み込むもので、読み込み順は

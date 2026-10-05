@@ -12,7 +12,7 @@ LLM プラグインのサイドバーを支えるクライアント／サーバ�
 Editor sidebar (vibe_ui)  ──Send──►  /llm-plugin/generate  ──►  Ollama / OpenAI / Custom
         ▲                                              │
         │                                              ▼
-   addMessageToUI                          response { response, model, elapsed }
+   addMessageToUI                          response { response, thought, model, elapsed }
    importFlowFromMessage  ◄──────────────────────────────┘
         │
         ├── extractFlowNodes  (LLMJsonParser → Vibe Schema → FlowConverterCore.toNodeRed)
@@ -23,6 +23,8 @@ Editor sidebar (vibe_ui)  ──Send──►  /llm-plugin/generate  ──►  
                                （差分で表現できないときは、消して入れ直す
                                  従来方式 replaceWorkspaceFlow にフォールバック）
 ```
+
+リクエストに `stream: true` を付けると、`/generate` は JSON 1 個ではなく Server-Sent Events スリームで答える — モデルが生んだ思考や本文の各断片が 1 行の `data:` として流れ、最後に `done` イベント(失敗なら `error`)。サイドバーは常にストリーミングで、応答は推論モデルの思考過程を含め届くそばから表示され、フローの適用は応答が完了してから。
 
 `src/core/` にある3つの独立したコアモジュールが、変換＋レイアウトの土台を形成する:
 
@@ -79,7 +81,7 @@ common → canvas_layout → flow_converter_core → llm_json_parser
 
 | Method | Path | 権限 | 用途 |
 |--------|------|------|---------|
-| POST | `/llm-plugin/generate` | write | プロンプト + フローコンテキストを LLM へ送信。`mode: "ask"` はフローの説明を求め、それ以外はスキーマを求める。モードがシステムプロンプトを選ぶので、判断はブラウザではなくここで行う。1時間でタイムアウトし、サイドバーが接続を閉じたら(停止)打ち切る |
+| POST | `/llm-plugin/generate` | write | プロンプト + フローコンテキストを LLM へ送信。`mode: "ask"` はフローの説明を求め、それ以外はスキーマを求める。モードがシステムプロンプトを選ぶので、判断はブラウザではなくここで行う。1時間でタイムアウトし、サイドバーが接続を閉じたら(停止)打ち切る。本文に `stream: true` を付けると応答は SSE スリームになる — 思考・本文の各断片が 1 行の `data:` として流れ、最後に `done`(失敗は `error`)イベント — これがサイドバーが使う形で、応答は届くそばから表示される |
 | GET | `/llm-plugin/settings` | read | 設定の読み取り(API キーはマスク) |
 | POST | `/llm-plugin/settings` | write | 設定の書き込み(ホワイトリスト項目のみ) |
 | GET | `/llm-plugin/chats` | read | 永続化されたチャットの一覧 |
@@ -365,7 +367,8 @@ API キーをそのまま引き継げる — 設定と認証情報の置き場�
 | ストレージ解決 | `chatsDir` / `checkpointsDir` / `persistenceEnabled`(`<userDir>/llm-plugin`。書けなければメモリのみ)、`writeFileAtomic` |
 | 設定 + 認証情報 | `getPluginSettings`, `savePluginSettings`、暗号化した認証情報ファイル、旧形式のキーの移行、`maskApiKey`, `redactSecrets` |
 | プロンプト構築 | `buildMessages`(システムプロンプトの読み込みと、現在のフローの Vibe Schema 化)。`llm-request` ノードはこれを使わず、自分のシステムプロンプトとプロンプトだけでメッセージを組む |
-| LLM アダプタ | `generateWithProvider(provider, settings, model, messages, {timeoutMs})` — 実際の送信先は3つ。Ollama のチャット API、OpenAI 本体(SDK の Responses API、`/v1/responses`。システムメッセージは `instructions` で送り、`store: false` を付ける。新しいモデルはこの API で提供され、この API でしか使えないものもある)、Custom(Chat Completions。llama.cpp / LM Studio / vLLM / LocalAI などのローカルサーバが話す形式)。いずれも応答を**ストリーミング**で受け取る。ストリーミングしないとエンドポイントは生成が終わるまでヘッダを返さず、Node の `fetch` はタイムアウト設定に関係なく 300 秒でヘッダ待ちを打ち切る(SDK はさらに生成全体を2回送り直していた)。ストリームは終端の印(Ollama の `done`、Chat Completions の `finish_reason`、Responses の `response.completed`。Responses が `incomplete` で終わった場合は理由を添えたエラーにする)が届いて初めて完結とみなす。途中で接続を切るプロキシでもストリームは同じように終わるので、印が無ければ短い応答ではなく `ECONNRESET` とする。タイムアウトは応答全体にかかる。通信エラーのコードは `cause` 側にあり、generate ルートはそこを読んで「接続できない」と伝える。 |
+| LLM アダプタ | `generateWithProvider(provider, settings, model, messages, {timeoutMs})` — 実際の送信先は3つ。Ollama のチャット API、OpenAI 本体(SDK の Responses API、`/v1/responses`。システムメッセージは `instructions` で送り、`store: false` を付ける。新しいモデルはこの API で提供され、この API でしか使えないものもある)、Custom(Chat Completions。llama.cpp / LM Studio / vLLM / LocalAI などのローカルサーバが話す形式)。いずれも応答を**ストリーミング**で受け取る。ストリーミングしないとエンドポイントは生成が終わるまでヘッダを返さず、Node の `fetch` はタイムアウト設定に関係なく 300 秒でヘッダ待ちを打ち切る(SDK はさらに生成全体を2回送り直していた)。ストリームは終端の印(Ollama の `done`、Chat Completions の `finish_reason`、Responses の `response.completed`。Responses が `incomplete` で終わった場合は理由を添えたエラーにする)が届いて初めて完結とみなす。途中で接続を切るプロキシでもストリームは同じように終わるので、印が無ければ短い応答ではなく `ECONNRESET` とする。タイムアウトは応答全体にかかる。通信エラーのコードは `cause` 側にあり、generate ルートはそこを読んで「接続できない」と伝える。いずれのプロバイダも推論モデルの思考過程を一緒に中継する。Chat Completions の `reasoning_content`(vLLM / LM Studio)または `reasoning`(llama.cpp)、Responses API の `summary`、Ollama の `thinking` デルタ — プロバイダが流してくる形のまま。思考は独立した断片として、通常は本文より先に届く。 |
+| クライアントへのストリーミング | `streamGenerateWithProvider(provider, settings, model, messages, onEvent, {timeoutMs, signal})` — 同じ 3 つのアダプタだが、応答は結合しない。思考と本文の各断片は到着した瞬間に `onEvent` に渡され、終端の印の前に切れたストリームはやはりエラーになる。`/generate` ルートの SSE 分岐は、この関数で各イベントを 1 行の `data:` として書くだけ。`generateWithThought` は `generateWithProvider` に収集した `thought` を付け加えたもの(推論しないモデルでは無い)で、非ストリーミングのルートと `llm-request` ノード(`msg.thought` として出す)が使う |
 
 ### `server.js`
 
@@ -376,7 +379,7 @@ API キーをそのまま引き継げる — 設定と認証情報の置き場�
 | チャット履歴 | `saveChatHistory`, `loadAllChatHistories`(チャット1件につき1ファイル) |
 | チェックポイント | `saveCheckpoint`(インポート1回につき1つのフロースナップショット) |
 | クライアントログ | `writeClientEvent`(秘匿情報を除去して `RED.log` へ) |
-| HTTP admin エンドポイント | 管理用ルートの登録。生成そのものはエンジンに委ねる |
+| HTTP admin エンドポイント | 管理用ルートの登録。生成そのものはエンジンに委ねる(`stream: true` があるとき `/generate` は SSE スリーム、なければ JSON 1 個で答える) |
 
 ### `node/` — `llm-request` ノード
 

@@ -1,8 +1,9 @@
 # `llm-request` ノード
 
 LLM Plugin のサイドバーと並んで登録されるノード(パレットカテゴリ **llm-plugin**)。
-フローから LLM を呼び出す。`msg.payload` を送り、モデルの応答を `msg.payload` に
-入れて出力する。プロバイダ・モデル・(任意の)システムプロンプトはノードに設定し、
+フローから LLM を呼び出す。`msg.payload` を送り、モデルの応答を `msg.payload` に、
+推論モデルの思考過程を `msg.thought` に(推論しないモデルでは無い)入れて出力する。
+プロバイダ・モデル・(任意の)システムプロンプトはノードに設定し、
 API キーと URL は **LLM Plugin サイドバー**(Settings)から継承する。
 
 このノードはフローを編集しない。以前の設計には、応答を開いているエディタに適用する
@@ -23,8 +24,9 @@ API キーと URL は **LLM Plugin サイドバー**(Settings)から継承する
 
 **入力:** `payload`(プロンプト。そのまま送る。オブジェクトは JSON 文字列化)、
 任意で `system`・`model`・`timeout`。
-**出力:** `payload`(応答テキスト)と `llm`(`{ provider, model, elapsed }`。elapsed は
-ミリ秒)。メッセージのほかのプロパティはそのまま通る。
+**出力:** `payload`(応答テキスト)、`thought`(推論モデルの思考過程 — 推論しない
+モデルでは無い)、`llm`(`{ provider, model, elapsed }`。elapsed はミリ秒)。
+メッセージのほかのプロパティはそのまま通る。
 
 **ステータス:** リクエスト中は青い点(経過秒数を更新)、成功で緑の `done (…)`、
 失敗で赤の `error` / `timeout`。エラーは `done(err)` に渡る(Catch ノードで拾える)。

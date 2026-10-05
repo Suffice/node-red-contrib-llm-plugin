@@ -698,10 +698,113 @@
             if (currentAbortController) currentAbortController.abort();
             currentAbortController = new AbortController();
 
-            // One endpoint for both modes; Agent also imports the reply (below).
+            // One endpoint for both modes; the reply arrives either as a
+            // single JSON answer (servers older than 0.6.3) or as an event
+            // stream: the model's thought, then its answer, piece by piece.
             let fetchStart = Date.now();
             // Where the reply's new nodes go, now and on an Apply Again.
             let homeWorkspaceId = getActiveWorkspaceId();
+
+            // The in-flight reply, painted into the loading bubble as it
+            // streams in. `root` is the bubble itself once the first piece
+            // lands, with its loading class dropped.
+            let live = null;
+            let thoughtSoFar = '';
+            let contentSoFar = '';
+            function paintLive() {
+                if (!live) return;
+                if (!live.root) {
+                    live.root = loadingMsg;
+                    if (loadingMsg) loadingMsg.classList.remove('loading-message');
+                }
+                if (thoughtSoFar && !live.thoughtTextEl) {
+                    live.thoughtEl = document.createElement('details');
+                    live.thoughtEl.className = 'llm-message-thought';
+                    live.thoughtEl.open = true;
+                    let summary = document.createElement('summary');
+                    summary.textContent = 'Thinking';
+                    live.thoughtTextEl = document.createElement('div');
+                    live.thoughtTextEl.className = 'llm-message-thought-text';
+                    live.thoughtEl.appendChild(summary);
+                    live.thoughtEl.appendChild(live.thoughtTextEl);
+                    if (live.contentEl) live.root.insertBefore(live.thoughtEl, live.contentEl);
+                    else live.root.appendChild(live.thoughtEl);
+                }
+                if (live.thoughtTextEl) live.thoughtTextEl.textContent = thoughtSoFar;
+                if (contentSoFar) {
+                    if (!live.contentEl) {
+                        live.contentEl = document.createElement('div');
+                        live.contentEl.className = 'message-content';
+                        live.root.appendChild(live.contentEl);
+                    }
+                    live.contentEl.textContent = contentSoFar;
+                }
+                let chatArea = document.getElementById('llm-plugin-chat');
+                if (chatArea) chatArea.scrollTop = chatArea.scrollHeight;
+            }
+
+            // Read the server's answer in whichever shape it chose.
+            function consume(res) {
+                let ct = (res.headers.get('content-type') || '');
+                if (ct.indexOf('application/json') !== -1) return res.json();
+                // An event stream: one `data:` line per output piece. A bare
+                // newline is a keep-alive tick carrying no data; `done` or
+                // `error` closes the stream.
+                return new Promise(function(resolve, reject) {
+                    let reader = res.body.getReader();
+                    let decoder = new TextDecoder();
+                    let buf = '';
+                    let usedModel = null;
+                    let totalElapsed = null;
+                    function step() {
+                        reader.read().then(function(r) {
+                            if (r.done) {
+                                if (totalElapsed == null) {
+                                    // A stream cut off before its end line is a failure
+                                    // to report, not a success to swallow.
+                                    reject(new Error('The stream ended before the reply finished'));
+                                } else {
+                                    resolve({
+                                        response: contentSoFar,
+                                        thought: thoughtSoFar || undefined,
+                                        model: usedModel || model,
+                                        elapsed: totalElapsed,
+                                        streamed: true
+                                    });
+                                }
+                                return;
+                            }
+                            buf += decoder.decode(r.value, { stream: true });
+                            let nl;
+                            while ((nl = buf.indexOf('\n')) !== -1) {
+                                let line = buf.slice(0, nl).trim();
+                                buf = buf.slice(nl + 1);
+                                if (line.indexOf('data:') !== 0) continue; // keep-alive tick
+                                let evt;
+                                try { evt = JSON.parse(line.slice(5).trim()); } catch (e) { continue; }
+                                if (evt.type === 'thought') {
+                                    thoughtSoFar += (evt.content || '');
+                                    live = live || {};
+                                    paintLive();
+                                } else if (evt.type === 'chunk') {
+                                    contentSoFar += (evt.content || '');
+                                    live = live || {};
+                                    paintLive();
+                                } else if (evt.type === 'done') {
+                                    if (evt.model) usedModel = evt.model;
+                                    totalElapsed = (evt.elapsed != null) ? evt.elapsed : (Date.now() - fetchStart);
+                                } else if (evt.type === 'error') {
+                                    reader.cancel().catch(function() {});
+                                    reject(new Error(evt.message || 'Generation failed'));
+                                    return;
+                                }
+                            }
+                            step();
+                        }).catch(reject);
+                    }
+                    step();
+                });
+            }
 
             Common.apiFetch('llm-plugin/generate', {
                 method: 'POST',
@@ -714,7 +817,8 @@
                     // Ask and Agent are different questions, not the same one
                     // handled differently afterwards: the server picks the
                     // instructions from this.
-                    mode: mode
+                    mode: mode,
+                    stream: true
                 }),
                 signal: currentAbortController.signal
             })
@@ -728,7 +832,7 @@
                             throw err;
                         });
                 }
-                return res.json();
+                return consume(res);
             })
             .then(function(data) {
                 if (loadingMsg) loadingMsg.remove();
@@ -744,6 +848,9 @@
                     targetFlowName: targetFlowName,
                     homeWorkspaceId: homeWorkspaceId
                 };
+                // A reasoning model's thought, kept with the message so it
+                // survives a chat reload too.
+                if (data.thought) metaOpts.thought = data.thought;
                 msgEl = LLMPlugin.ChatManager.addMessage(data.response, false, metaOpts);
 
                 if (mode === 'agent' && msgEl) {

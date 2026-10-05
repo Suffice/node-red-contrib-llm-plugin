@@ -28,7 +28,12 @@ Add from "Manage palette" or
 npm install @background404/node-red-contrib-llm-plugin
 ```
 
-Restart Node-RED after install.
+Restart Node-RED after install. A palette install updates the files and the
+editor's plugin list, but the running runtime keeps executing the previous
+plugin code until it is restarted. Installing without a restart leaves the
+editor serving the new plugin UI against the old backend routes; the
+sidebar may then fail to load (the console shows the 404), and the editor
+can stall at "Loading Plugins". If that happens, restart Node-RED.
 
 Requires Node-RED 4.0 or later on Node.js 22 or later.
 
@@ -62,6 +67,7 @@ node: a minimal inject → venv → debug flow kept in the active tab.
 ## Features
 
 - **Two modes, two questions**: **Ask** is read-only — it is given your flow and asked to explain and diagnose it, so "why does this not fire?" comes back as "`inject_tick`'s `repeat` is empty" rather than as a flow to import. **Agent** is the one that builds, and applies what it builds.
+- **The reply arrives as it is generated**: the answer is streamed from the provider — including a reasoning model's chain of thought — and painted into the sidebar as the model produces it; the flow is applied only once the reply is complete.
 - **Node names are links**: in either mode, a node the reply mentions is clickable — it switches to that tab and reveals the node on the canvas (config nodes open their edit dialog).
 - **Chat history**: conversations are persisted on the server and can be loaded, deleted (several at once, or all), or continued across sessions.
 - **Checkpoint / Restore**: a snapshot of the flow is taken immediately before each import, and a per-message Restore button rewinds the workspace to that pre-edit state. It sits above the prompt it undoes, and **Apply Again** sits on the reply's schema block, so you can switch between the flow you had and the one the model proposed.
@@ -74,7 +80,9 @@ node: a minimal inject → venv → debug flow kept in the active tab.
 ## `llm-request` node
 
 A node (palette category **llm-plugin**) so a flow can call an LLM without the
-sidebar: `msg.payload` goes in, the reply comes out on `msg.payload`. Set a
+sidebar: `msg.payload` goes in, the reply comes out on `msg.payload`, and a
+reasoning model's chain of thought on `msg.thought` (absent when the model
+did not think). Set a
 provider, a model and, optionally, a system prompt on the node; API keys and
 URLs come from the sidebar's Settings. The node does not edit flows — that is
 the sidebar's job. An example is under **Import → Examples → llm-plugin**.

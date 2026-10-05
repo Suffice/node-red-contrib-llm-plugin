@@ -86,12 +86,13 @@ module.exports = function(RED) {
                 node.status({ fill: 'blue', shape: 'dot', text: 'requesting…' });
                 const started = Date.now();
                 startStatusTicker(started);
-                const response = await core.generateWithProvider(provider, settings, model, messages,
+                const result = await core.generateWithThought(provider, settings, model, messages,
                     { timeoutMs: timeoutSec * 1000 });
                 stopStatusTicker();
 
                 const elapsedMs = Date.now() - started;
-                msg.payload = response;
+                msg.payload = result.content;
+                if (result.thought) msg.thought = result.thought;
                 msg.llm = { provider: provider, model: model, elapsed: elapsedMs };
                 const elapsedText = elapsedMs < 10000
                     ? elapsedMs + 'ms'

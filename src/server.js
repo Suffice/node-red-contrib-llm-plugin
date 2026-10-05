@@ -19,6 +19,8 @@ function createLLMPluginServer(RED) {
     const getPluginSettings = core.getPluginSettings;
     const savePluginSettings = core.savePluginSettings;
     const generateWithProvider = core.generateWithProvider;
+    const streamGenerateWithProvider = core.streamGenerateWithProvider;
+    const generateWithThought = core.generateWithThought;
     const buildMessages = core.buildMessages;
     const maskApiKey = core.maskApiKey;
     const redactSecrets = core.redactSecrets;
@@ -316,8 +318,16 @@ function createLLMPluginServer(RED) {
     // One generation endpoint; `mode: 'ask'` explains, anything else builds, so
     // the server chooses the prompt. Bounded like the node, and abandoned when the
     // sidebar goes away (Stop only closes the connection).
+    //
+    // `stream: true` switches the answer to an event stream: one
+    // `data:` line per piece of output the model produces
+    // (`{ type: 'thought' | 'chunk', content }`), then a final
+    // `{ type: 'done', ... }` — or a `{ type: 'error', message }` line
+    // when the run fails. Bare JSON, as before, for `stream: false`
+    // (the default) and for anything a newer server cannot stream.
     RED.httpAdmin.post('/llm-plugin/generate', guard(PERM_WRITE), async function(req, res) {
         const { model, prompt, currentFlow, activeWorkspaceId, mode } = req.body;
+        const stream = !!(req.body && req.body.stream);
         if (!model || !prompt) {
             return res.status(400).json({ error: 'Model and prompt are required' });
         }
@@ -352,33 +362,75 @@ function createLLMPluginServer(RED) {
         const abort = new AbortController();
         res.on('close', function() { if (!res.writableFinished) abort.abort(); });
 
+        if (stream) {
+            res.status(200);
+            res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+            res.setHeader('Cache-Control', 'no-cache');
+            if (res.flushHeaders) res.flushHeaders();
+            // Bare-newline keep-alive: between the last token and a slow
+            // model's `done` line (or a long silence on a stalled
+            // endpoint) a proxy in between may time the connection out.
+            const keepAlive = setInterval(function() {
+                if (res.writableEnded) return;
+                try { res.write('\n'); } catch (e) { /* client gone */ }
+            }, 5000);
+            try {
+                await streamGenerateWithProvider(provider, settings, model, enhancedMessages,
+                    function(evt) {
+                        if (res.writableEnded) return;
+                        try { res.write('data: ' + JSON.stringify(evt) + '\n\n'); } catch (e) { /* client gone */ }
+                    },
+                    { timeoutMs: core.DEFAULT_TIMEOUT_MS, signal: abort.signal });
+                if (!res.writableEnded) {
+                    res.write('data: ' + JSON.stringify({ type: 'done', model: model, elapsed: Date.now() - genStart }) + '\n\n');
+                }
+            } catch (error) {
+                if (!abort.signal.aborted) {
+                    const errorMessage = generationErrorMessage(error, provider);
+                    RED.log.error('[LLM Plugin] Generation error: ' + errorMessage);
+                    if (!res.writableEnded) {
+                        try { res.write('data: ' + JSON.stringify({ type: 'error', message: errorMessage }) + '\n\n'); } catch (e) { /* client gone */ }
+                    }
+                }
+            } finally {
+                clearInterval(keepAlive);
+                if (!res.writableEnded) res.end();
+            }
+            return;
+        }
+
         try {
-            const response = await generateWithProvider(provider, settings, model, enhancedMessages,
+            // One-shot, but with the thought collected so the chat keeps
+            // it for display, not just the reply text.
+            const result = await generateWithThought(provider, settings, model, enhancedMessages,
                 { timeoutMs: core.DEFAULT_TIMEOUT_MS, signal: abort.signal });
-            res.json({ response: response, elapsed: Date.now() - genStart, model: model });
+            res.json({ response: result.content, thought: result.thought, elapsed: Date.now() - genStart, model: model });
         } catch (error) {
             if (abort.signal.aborted) return;      // nobody is left to answer
             // Log only safe fields  -  never log the full error object which may contain sensitive headers
-            const safeErrorText = redactSecrets(error && error.message ? error.message : error);
-            RED.log.error('[LLM Plugin] Generation error: ' + safeErrorText);
-            let errorMessage = 'Generation failed';
-            const providerLabel = provider === 'ollama'
-                ? 'Ollama'
-                : (provider === 'custom' ? 'the custom OpenAI-compatible endpoint' : 'the LLM provider');
-            const code = networkCode(error);
-            if (code === 'ECONNREFUSED') {
-                errorMessage = 'Could not connect to ' + providerLabel + '. Please ensure it is running and accessible.';
-            } else if (code === 'ECONNRESET') {
-                errorMessage = 'The connection to ' + providerLabel + ' was unexpectedly closed. Please check that the server is running and stable.';
-            } else if (code === 'ETIMEDOUT' || (error && error.message && error.message.includes('timeout'))) {
-                errorMessage = 'Request timed out. The model may be too slow or not responding.';
-            } else {
-                errorMessage = redactSecrets(error && error.message ? error.message : error);
-            }
+            const errorMessage = generationErrorMessage(error, provider);
+            RED.log.error('[LLM Plugin] Generation error: ' + errorMessage);
             res.status(500).json({ error: errorMessage });
         }
     });
-
+    // Map a generation failure to a message the user can act on; shared
+    // by the one-shot and the streaming answers above.
+    function generationErrorMessage(error, provider) {
+        const providerLabel = provider === 'ollama'
+            ? 'Ollama'
+            : (provider === 'custom' ? 'the custom OpenAI-compatible endpoint' : 'the LLM provider');
+        const code = networkCode(error);
+        if (code === 'ECONNREFUSED') {
+            return 'Could not connect to ' + providerLabel + '. Please ensure it is running and accessible.';
+        }
+        if (code === 'ECONNRESET') {
+            return 'The connection to ' + providerLabel + ' was unexpectedly closed. Please check that the server is running and stable.';
+        }
+        if (code === 'ETIMEDOUT' || (error && error.message && error.message.includes('timeout'))) {
+            return 'Request timed out. The model may be too slow or not responding.';
+        }
+        return redactSecrets(error && error.message ? error.message : error);
+    }
     // --- Settings endpoints ---
     RED.httpAdmin.get('/llm-plugin/settings', guard(PERM_READ), function(req, res) {
         const settings = Object.assign({}, getPluginSettings());
@@ -592,20 +644,40 @@ function createLLMPluginServer(RED) {
         try {
             markedPath = path.join(path.dirname(require.resolve('marked/package.json')), 'lib', 'marked.umd.js');
         } catch (error) {
-            return res.status(404).send('/* marked.js not available */');
+            return res.status(404).send('/* marked.js not available: ' + errText(error) +
+                ' (is the marked dependency installed?) */');
         }
         serveFile(res, markedPath, 'application/javascript; charset=utf-8');
     });
 
     // DOMPurify, handed to the plugin alone: its UMD build would otherwise
     // replace the editor's own global `DOMPurify`, which red.js relies on.
+    // Resolved through the main entry - which a package's exports map
+    // always covers - then looking for the UMD build next to it or one
+    // level up, tolerating both package layouts. (Resolving
+    // dompurify/package.json would throw on packages with an exports map
+    // that does not export it, 404-ing the route for no reason.) A layout
+    // mismatch degrades to a 404 that says WHY, not a silent "not available".
     RED.httpAdmin.get('/llm-plugin/vendor/purify.js', function(req, res) {
         let source;
         try {
-            let dist = path.dirname(require.resolve('dompurify'));
-            source = fs.readFileSync(path.join(dist, 'purify.min.js'), 'utf8');
+            const base = path.dirname(require.resolve('dompurify'));
+            for (const dir of [base, path.dirname(base)]) {
+                for (const name of ['purify.min.js', 'purify.js']) {
+                    const file = path.join(dir, name);
+                    if (fs.existsSync(file)) {
+                        source = fs.readFileSync(file, 'utf8');
+                        break;
+                    }
+                }
+                if (source !== undefined) break;
+            }
+            if (source === undefined) {
+                return res.status(404).send('/* purify.js not available: no UMD build found next to the dompurify main entry */');
+            }
         } catch (error) {
-            return res.status(404).send('/* purify.js not available */');
+            return res.status(404).send('/* purify.js not available: ' + errText(error) +
+                ' (is the dompurify dependency installed? restart Node-RED after a palette install) */');
         }
         res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
         res.send('(function() { var module = { exports: {} }, exports = module.exports;\n' + source +

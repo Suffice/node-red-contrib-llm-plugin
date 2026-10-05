@@ -441,6 +441,57 @@
     max-height: 400px;
     overflow: auto;
 }
+/* A reasoning model's thought: streamed ahead of the answer while the reply
+   is generating, then kept on the message meta and shown above it, collapsed
+   by default so the answer leads. */
+.llm-message-thought {
+    margin: 0 0 6px 0;
+    max-width: 80%;
+    border: 1px solid #cbd5e0;
+    border-left: 3px solid #b7791f;
+    border-radius: 5px;
+    background: #fffaf0;
+}
+.llm-message-thought summary {
+    cursor: pointer;
+    padding: 6px 10px;
+    background: #faf3e3;
+    color: #7c5e10;
+    font-size: 12px;
+    font-weight: 600;
+    user-select: none;
+    outline: none;
+    list-style: none;
+}
+.llm-message-thought summary::-webkit-details-marker {
+    display: none;
+}
+.llm-message-thought summary::before {
+    content: '\25B6';
+    display: inline-block;
+    margin-right: 6px;
+    font-size: 10px;
+    transition: transform 0.15s;
+}
+.llm-message-thought[open] > summary::before {
+    transform: rotate(90deg);
+}
+.llm-message-thought summary:hover {
+    background: #f5e8c8;
+}
+.llm-message-thought-text {
+    margin: 0;
+    padding: 8px 10px;
+    border-top: 1px solid #cbd5e0;
+    max-height: 240px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: 12px;
+    font-style: italic;
+    color: #555;
+    line-height: 1.5;
+}
 .llm-plugin-input {
     border-top: 1px solid #ddd;
     padding: 10px;

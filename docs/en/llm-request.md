@@ -2,9 +2,10 @@
 
 The node registered alongside the LLM Plugin sidebar (palette category
 **llm-plugin**) so a flow can call an LLM: `msg.payload` goes in, the model's
-reply comes out on `msg.payload`. Provider, model and an optional system prompt
-are set on the node; API keys and URLs are inherited from the **LLM Plugin
-sidebar** (Settings).
+reply comes out on `msg.payload` and a reasoning model's chain of thought on
+`msg.thought` (absent when the model did not think). Provider, model and an
+optional system prompt are set on the node; API keys and URLs are inherited
+from the **LLM Plugin sidebar** (Settings).
 
 The node does not edit flows. An earlier design had an **Agent** mode that
 applied the reply to the open editor; it was withdrawn before release because
@@ -25,8 +26,10 @@ the sidebar's job.
 
 **Inputs:** `payload` (the prompt, sent as given; objects are JSON-stringified),
 and optionally `system`, `model`, `timeout`.
-**Outputs:** `payload` (the reply text) and `llm` (`{ provider, model, elapsed }`,
-elapsed in ms). Every other property of the message passes through.
+**Outputs:** `payload` (the reply text), `thought` (a reasoning model's chain
+of thought — only present when the model thought) and `llm` (`{ provider,
+model, elapsed }`, elapsed in ms). Every other property of the message passes
+through.
 
 **Status:** blue dot while requesting (ticks the elapsed seconds), green
 `done (…)` on success, red `error` / `timeout` on failure. An error goes to
